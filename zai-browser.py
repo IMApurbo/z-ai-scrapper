@@ -160,8 +160,7 @@ class ZAIScraper:
             # ── 2. Type & Send ──
             input_box = self.page.locator(self.INPUT_SELECTOR)
             input_box.click()
-            input_box.fill("")
-            input_box.type(message, delay=25)
+            input_box.fill(message)
             time.sleep(0.2)
             input_box.press("Enter")
 
