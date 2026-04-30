@@ -1,7 +1,52 @@
 import time
 import json
+import re
+import subprocess
+import sys
 from playwright.sync_api import sync_playwright
 from datetime import datetime
+
+# ── Optional: html2text for HTML→Markdown conversion ──
+try:
+    import html2text as _html2text_mod
+    _H2T = _html2text_mod.HTML2Text()
+    _H2T.ignore_links = False
+    _H2T.ignore_images = True
+    _H2T.body_width = 0          # no line-wrapping
+    _H2T.protect_links = True
+    _H2T.wrap_links = False
+    HAS_HTML2TEXT = True
+except ImportError:
+    HAS_HTML2TEXT = False
+
+
+def _apply_inline(text, BOLD, ITALIC, STRIKE, CYAN, DIM, RESET):
+    """Apply inline MD formatting (bold, italic, code, strikethrough, links) with ANSI."""
+    # Inline code first (prevent nested processing)
+    parts = re.split(r'(`[^`]+`)', text)
+    result = []
+    for part in parts:
+        if part.startswith('`') and part.endswith('`') and len(part) > 1:
+            result.append(f'{CYAN}{part[1:-1]}{RESET}')
+        else:
+            p = part
+            # Bold+italic ***text***
+            p = re.sub(r'\*\*\*(.*?)\*\*\*', lambda m: f'{BOLD}{ITALIC}{m.group(1)}{RESET}', p)
+            # Bold **text**
+            p = re.sub(r'\*\*(.*?)\*\*',     lambda m: f'{BOLD}{m.group(1)}{RESET}', p)
+            # Italic *text*
+            p = re.sub(r'\*(.*?)\*',          lambda m: f'{ITALIC}{m.group(1)}{RESET}', p)
+            # Bold __text__
+            p = re.sub(r'__(.*?)__',          lambda m: f'{BOLD}{m.group(1)}{RESET}', p)
+            # Italic _text_
+            p = re.sub(r'_(.*?)_',            lambda m: f'{ITALIC}{m.group(1)}{RESET}', p)
+            # Strikethrough ~~text~~
+            p = re.sub(r'~~(.*?)~~',          lambda m: f'{STRIKE}{m.group(1)}{RESET}', p)
+            # Links [text](url)
+            p = re.sub(r'\[([^\]]+)\]\(([^)]+)\)',
+                       lambda m: f'{BOLD}{m.group(1)}{RESET}{DIM}({m.group(2)}){RESET}', p)
+            result.append(p)
+    return ''.join(result)
 
 
 class ZAIScraper:
@@ -17,6 +62,7 @@ class ZAIScraper:
         self.STOP_BTN_SELECTOR = "button[aria-label*='stop' i], button[aria-label*='Stop' i]"
         self.RESPONSE_SELECTOR = "div.markdown-prose"   # ← EXACT from your inspection
         self.THINKING_SELECTOR = "blockquote"           # ← thinking inside markdown-prose
+        self._last_was_web_search = False
 
     # ─────────────────────────────────────────────
     # Browser Setup
@@ -143,15 +189,15 @@ class ZAIScraper:
     # Core: Send Message
     # ─────────────────────────────────────────────
 
-    def send_message(self, message: str) -> str:
+    def send_message(self, message: str) -> tuple:
         """
-        1. Count existing .markdown-prose blocks
-        2. Type into textarea#chat-input + Enter
-        3. Wait for stop button → disappear
-        4. Scrape last .markdown-prose → remove blockquote → get <p> text
+        Returns (markdown, html, was_web_search).
+        markdown = MD-converted response text
+        html     = raw cleaned HTML
+        was_web_search = True if web search was used this turn
         """
         if not self.page:
-            return "[Error] Browser not started."
+            return ("[Error] Browser not started.", "", False)
 
         try:
             # ── 1. Snapshot count ──
@@ -174,23 +220,60 @@ class ZAIScraper:
             time.sleep(0.5)
 
             # ── 6. Scrape ──
-            return self._scrape_response()
+            md, html = self._scrape_response()
+            return (md, html, self._last_was_web_search)
 
         except Exception as e:
-            return f"[Error] {str(e)}"
+            return (f"[Error] {str(e)}", "", False)
 
     # ─────────────────────────────────────────────
     # Wait Helpers
     # ─────────────────────────────────────────────
 
+    def _is_searching_web(self) -> bool:
+        """Return True if 'Searching the web' shimmer span is currently visible."""
+        try:
+            shimmer = self.page.locator('span.text-sm.font-semibold.shimmer')
+            for i in range(shimmer.count()):
+                el = shimmer.nth(i)
+                if el.is_visible():
+                    if "searching" in (el.inner_text() or "").lower():
+                        return True
+        except:
+            pass
+        return False
+
+    def _is_stop_visible(self) -> bool:
+        """Return True if the stop button is currently visible."""
+        try:
+            stop = self.page.locator(self.STOP_BTN_SELECTOR)
+            return stop.count() > 0 and stop.is_visible()
+        except:
+            return False
+
     def _wait_for_new_response(self, before_count: int, timeout: int = 30):
-        """Wait until a new .markdown-prose block appears"""
+        """
+        Wait until activity starts after sending a message.
+        Accepts either:
+          - a new .markdown-prose block appearing, OR
+          - the 'Searching the web' shimmer appearing
+          - the stop button appearing
+        whichever comes first.
+        """
         print("    ⌛ Waiting for response...", end="", flush=True)
         start = time.time()
 
         while time.time() - start < timeout:
-            current = self.page.locator(self.RESPONSE_SELECTOR).count()
-            if current > before_count:
+            # New prose block appeared
+            if self.page.locator(self.RESPONSE_SELECTOR).count() > before_count:
+                print(" ✓")
+                return True
+            # Web search started
+            if self._is_searching_web():
+                print(" ✓")
+                return True
+            # Stop button appeared (thinking / generation started)
+            if self._is_stop_visible():
                 print(" ✓")
                 return True
             time.sleep(0.3)
@@ -198,135 +281,645 @@ class ZAIScraper:
         print(" ⚠ timeout")
         return False
 
-    def _wait_for_stream_complete(self, timeout: int = 120):
+    def _wait_for_stream_complete(self, timeout: int = 180):
         """
-        Wait for AI to finish generating.
-        Strategy 1: Stop button disappears
-        Strategy 2: .markdown-prose text stabilizes
+        Full wait pipeline — handles plain / thinking / search / search+thinking:
+
+        PHASE 1 — Web search shimmer (optional):
+            Poll up to 8 s for 'Searching the web' shimmer to appear.
+            If seen, wait for it to fully disappear before proceeding.
+
+        PHASE 2 — Stop button (streaming / thinking):
+            After search ends (or from the start if no search), poll up to
+            15 s for the stop button to appear — generous because search+thinking
+            causes the stop button to reappear AFTER the search phase with a delay.
+            Once seen, wait for it to disappear (= generation complete).
+
+        PHASE 3 — HTML stabilization fallback:
+            If stop button never appeared, wait for the total innerHTML size of
+            ALL markdown-prose blocks to stop changing for 3 consecutive seconds.
+            Uses HTML length (not innerText) so structural changes (new tags,
+            mindmaps, SVG) are detected too.
+
+        PHASE 4 — Post-complete safety buffer:
+            After stop button gone OR text stable, do one final check: wait until
+            BOTH stop button is gone AND shimmer is gone AND HTML size unchanged
+            for 2 ticks. Catches cases where streaming briefly pauses mid-response.
         """
         start = time.time()
+        self._last_was_web_search = False
 
-        # ── Strategy 1: Stop button ──
-        try:
-            stop = self.page.locator(self.STOP_BTN_SELECTOR)
-            if stop.count() > 0 and stop.is_visible():
-                print("    ⏳ Generating", end="", flush=True)
-                while time.time() - start < timeout:
-                    if not stop.is_visible():
-                        print(" ✓")
-                        return
-                    print(".", end="", flush=True)
-                    time.sleep(0.5)
-                print()
-                return
-        except:
-            pass
+        def remaining():
+            return timeout - (time.time() - start)
 
-        # ── Strategy 2: Text stabilization ──
-        print("    ⏳ Streaming", end="", flush=True)
-        last_text = ""
-        stable_ticks = 0
-        needed = 6  # 3 seconds (6 × 0.5s)
-
-        while time.time() - start < timeout:
+        def get_html_size() -> int:
+            """Return total character count of all markdown-prose innerHTML."""
             try:
-                # Get last markdown-prose text
-                blocks = self.page.locator(self.RESPONSE_SELECTOR).all()
-                if blocks:
-                    current = blocks[-1].inner_text()
-                    if current and current == last_text:
-                        stable_ticks += 1
-                        if stable_ticks >= needed:
+                return self.page.evaluate("""() => {
+                    const blocks = document.querySelectorAll('div.markdown-prose');
+                    let total = 0;
+                    blocks.forEach(b => { total += b.innerHTML.length; });
+                    return total;
+                }""") or 0
+            except:
+                return 0
+
+        # ── PHASE 1: Web search shimmer ───────────────────────────────────────
+        shimmer_seen = False
+        shimmer_deadline = time.time() + 8   # wider window
+        while time.time() < shimmer_deadline:
+            if self._is_searching_web():
+                shimmer_seen = True
+                break
+            # Also stop early if stop button appears (no search, just thinking)
+            if self._is_stop_visible():
+                break
+            time.sleep(0.25)
+
+        if shimmer_seen:
+            self._last_was_web_search = True
+            print("    🔍 Searching the web", end="", flush=True)
+            while remaining() > 0:
+                time.sleep(0.5)
+                if not self._is_searching_web():
+                    print(" ✓")
+                    break
+                print(".", end="", flush=True)
+            else:
+                print(" ⚠ search timeout")
+            time.sleep(0.4)   # UI transition gap
+
+        # ── PHASE 2: Stop button ──────────────────────────────────────────────
+        # After search, stop button may take several seconds to reappear.
+        # For web-search mode we wait up to 15 s for it to appear.
+        stop_seen = False
+        stop_poll_limit = 15 if shimmer_seen else 5
+        stop_deadline = time.time() + stop_poll_limit
+        while time.time() < stop_deadline and remaining() > 0:
+            if self._is_stop_visible():
+                stop_seen = True
+                break
+            time.sleep(0.2)
+
+        if stop_seen:
+            print("    ⏳ Streaming", end="", flush=True)
+            # Wait for stop button to disappear — but CONFIRM it stays gone.
+            # During web-search streaming the button can vanish briefly mid-stream
+            # (network pause / render gap) then reappear. We require it to be
+            # continuously absent for `confirm_needed` consecutive ticks before
+            # declaring done. If it reappears after going away, reset the counter.
+            confirm_needed = 3   # 1.5 s @ 0.5 s/tick — enough to catch blips
+            if shimmer_seen:
+                confirm_needed = 4  # 2 s for web-search, slightly more conservative
+
+            gone_ticks = 0
+            while remaining() > 0:
+                time.sleep(0.5)
+                if self._is_stop_visible():
+                    # Still (or again) streaming — reset confirmation counter
+                    gone_ticks = 0
+                    print(".", end="", flush=True)
+                else:
+                    gone_ticks += 1
+                    if gone_ticks >= confirm_needed:
+                        # Also verify no shimmer restarted (second search round)
+                        if not self._is_searching_web():
                             print(" ✓")
                             return
-                    else:
-                        stable_ticks = 0
-                        last_text = current
-                        print(".", end="", flush=True)
-            except:
-                pass
-            time.sleep(0.5)
+                        else:
+                            # New search round started — loop back to Phase 1 logic
+                            print(" ↻", end="", flush=True)
+                            gone_ticks = 0
+                            # Wait for this shimmer to finish too
+                            while remaining() > 0:
+                                time.sleep(0.5)
+                                if not self._is_searching_web():
+                                    break
+                                print(".", end="", flush=True)
+                            # Then wait for stop button cycle again
+                            while remaining() > 0:
+                                time.sleep(0.5)
+                                if self._is_stop_visible():
+                                    break
+                            gone_ticks = 0  # reset for the new streaming phase
+            print(" ⚠ timeout")
+            return
 
-        print(" ⚠ timeout")
+        else:
+            # ── PHASE 3: HTML size stabilization fallback ─────────────────────
+            # Only reached if stop button never appeared at all (very fast response).
+            print("    ⏳ Stabilizing", end="", flush=True)
+            last_size = 0
+            stable_ticks = 0
+            needed = 6   # 3 s × 0.5 s ticks
+
+            while remaining() > 0:
+                size = get_html_size()
+                if size > 0 and size == last_size:
+                    stable_ticks += 1
+                    if stable_ticks >= needed:
+                        if not self._is_stop_visible() and not self._is_searching_web():
+                            print(" ✓")
+                            return
+                        else:
+                            stable_ticks = 0
+                else:
+                    stable_ticks = 0
+                    last_size = size
+                    print(".", end="", flush=True)
+                time.sleep(0.5)
+            print(" ⚠ timeout")
 
     # ─────────────────────────────────────────────
-    # Scraping — div.markdown-prose → skip blockquote → <p>
+    # Scraping — full HTML → Markdown pipeline
     # ─────────────────────────────────────────────
 
-    def _scrape_response(self) -> str:
+    def _scrape_html(self) -> str:
         """
-        DOM structure:
-          <div class="markdown-prose">
-            <blockquote>          ← thinking/reasoning — REMOVE
-              ...internal thoughts...
-            </blockquote>
-            <p>Real answer here</p>    ← KEEP
-            <p>More answer...</p>      ← KEEP
-            <ul><li>...</li></ul>      ← KEEP
-          </div>
-
-        JS clone → remove blockquote → collect p/li/h tags
+        Grab raw cleaned innerHTML from the LAST TURN's .markdown-prose blocks only.
+        Scopes to the current turn by walking up to the nearest turn/message container
+        and only collecting prose blocks inside it — prevents repeating all prior turns.
+        Also strips: thinking, SVG, citations/timestamps, footnote spans.
         """
         try:
-            result = self.page.evaluate("""() => {
-                // Get ALL .markdown-prose blocks
-                const blocks = document.querySelectorAll('div.markdown-prose');
-                if (!blocks || blocks.length === 0) {
-                    return '[Error] No div.markdown-prose found';
+            return self.page.evaluate("""() => {
+                const allBlocks = document.querySelectorAll('div.markdown-prose');
+                if (!allBlocks || allBlocks.length === 0) return '';
+
+                const last = allBlocks[allBlocks.length - 1];
+
+                // ── Find the turn container ───────────────────────────────────
+                // Walk up the DOM to find the nearest ancestor that looks like a
+                // message/turn wrapper. Common patterns: [data-role], [class*=message],
+                // [class*=turn], [class*=assistant], [class*=response].
+                // If none found, fall back to the immediate parent.
+                function getTurnContainer(el) {
+                    const turnPatterns = [
+                        e => e.dataset && (e.dataset.role || e.dataset.turn || e.dataset.message),
+                        e => /\\b(message|turn|response|assistant|ai-message|chat-message)\\b/i
+                                .test(e.className || ''),
+                        e => e.getAttribute && e.getAttribute('role') === 'listitem',
+                    ];
+                    let node = el.parentElement;
+                    let steps = 0;
+                    while (node && node !== document.body && steps < 10) {
+                        for (const test of turnPatterns) {
+                            if (test(node)) return node;
+                        }
+                        node = node.parentElement;
+                        steps++;
+                    }
+                    // Fallback: use grandparent of the last prose block
+                    return el.parentElement || el;
                 }
 
-                // Take the LAST one (most recent response)
-                const last = blocks[blocks.length - 1];
+                const turnContainer = getTurnContainer(last);
 
-                // Clone — never modify real DOM
-                const clone = last.cloneNode(true);
+                // ── Collect ALL markdown-prose blocks inside this turn only ───
+                const turnBlocks = Array.from(
+                    turnContainer.querySelectorAll('div.markdown-prose')
+                );
 
-                // Remove thinking/reasoning blocks
-                const removeSelectors = [
-                    'blockquote',
-                    'details',
-                    '[class*="think"]',
-                    '[class*="reason"]',
-                    '[class*="internal"]',
-                    '[data-type="thinking"]',
-                ];
-                removeSelectors.forEach(sel => {
-                    clone.querySelectorAll(sel).forEach(el => el.remove());
-                });
+                // If querySelectorAll found nothing (scope too tight), fall back
+                // to just the last block.
+                const blocks = turnBlocks.length > 0 ? turnBlocks : [last];
 
-                // Collect content elements
-                const contentSelectors = 'p, li, h1, h2, h3, h4, h5, h6, pre, td';
-                const contentEls = clone.querySelectorAll(contentSelectors);
+                // ── Clean and extract HTML from each block ────────────────────
+                const htmlParts = [];
+                const seenHTML = new Set();   // exact-dedup within this turn
 
-                if (contentEls.length > 0) {
-                    // Deduplicate (nested li inside ul etc.)
-                    const seen = new Set();
-                    const texts = [];
+                blocks.forEach(block => {
+                    const clone = block.cloneNode(true);
 
-                    contentEls.forEach(el => {
-                        const t = el.innerText?.trim() || '';
-                        if (t && !seen.has(t)) {
-                            // Skip if this text is contained in an already-added text
-                            const isNested = texts.some(existing => existing.includes(t));
-                            if (!isNested) {
-                                seen.add(t);
-                                texts.push(t);
+                    // Remove thinking / reasoning wrappers
+                    [
+                        'blockquote', 'details',
+                        '[class*="think"]', '[class*="reason"]',
+                        '[class*="internal"]', '[data-type="thinking"]',
+                    ].forEach(sel => clone.querySelectorAll(sel).forEach(e => e.remove()));
+
+                    // Remove purely decorative / non-content nodes
+                    clone.querySelectorAll(
+                        'svg, script, style, noscript'
+                    ).forEach(e => e.remove());
+
+                    // Remove citation timestamp elements:
+                    // e.g. <span class="...">1m</span>, <sup>1</sup>, <cite>...
+                    // These are tiny inline nodes with numbers/timestamps only.
+                    clone.querySelectorAll('sup, cite, [class*="citation"], [class*="footnote"], [class*="timestamp"], [class*="time-ago"]')
+                        .forEach(e => e.remove());
+
+                    // Strip timestamp-like text-only spans: spans whose ENTIRE
+                    // trimmed text matches a time pattern (1m, 2h, 3d, 1w etc.)
+                    clone.querySelectorAll('span').forEach(span => {
+                        const t = (span.textContent || '').trim();
+                        // Remove if it's a bare timestamp (e.g. "1m", "2h", "3d")
+                        if (/^\\d+[smhdw]$/.test(t)) {
+                            span.remove();
+                            return;
+                        }
+                        // Unwrap cosmetic spans (no role/aria) — keep their children
+                        if (!span.getAttribute('role') && !span.getAttribute('aria-label')) {
+                            const parent = span.parentNode;
+                            if (parent) {
+                                while (span.firstChild) parent.insertBefore(span.firstChild, span);
+                                span.remove();
                             }
                         }
                     });
 
-                    if (texts.length > 0) return texts.join('\\n\\n');
-                }
+                    const html = clone.innerHTML.trim();
+                    if (html && !seenHTML.has(html)) {
+                        seenHTML.add(html);
+                        htmlParts.push(html);
+                    }
+                });
 
-                // Fallback: all remaining inner text
-                const fallback = clone.innerText?.trim() || '';
-                return fallback || '[Error] Empty after cleanup';
-            }""")
+                return htmlParts.join('\\n');
+            }""") or ""
+        except Exception as e:
+            return ""
 
-            return result.strip() if result else "[Error] Empty response"
+    def _html_to_md(self, html: str) -> str:
+        """
+        Convert HTML → clean Markdown.
+        Uses html2text if available, otherwise falls back to a hand-rolled
+        recursive parser that handles:
+          Block:   h1-h6, p, div, blockquote, pre/code, ul/ol/li, table/tr/td/th, hr
+          Inline:  strong/b, em/i, u, s/del, code, a, br, span
+          Ignored: svg, script, style, noscript
+        """
+        if not html or not html.strip():
+            return ""
+
+        if HAS_HTML2TEXT:
+            try:
+                return _H2T.handle(html).strip()
+            except Exception:
+                pass  # fall through to manual
+
+        # ── Manual recursive HTML→MD converter ───────────────────────────────
+        try:
+            from html.parser import HTMLParser
+
+            class _MDParser(HTMLParser):
+                BLOCK  = {'h1','h2','h3','h4','h5','h6','p','div','section',
+                           'article','header','footer','main','nav','aside',
+                           'blockquote','pre','ul','ol','li','table','thead',
+                           'tbody','tfoot','tr','hr','br','figure','figcaption'}
+                IGNORE = {'svg','script','style','noscript','button','input',
+                          'select','textarea','form','head','meta','link',
+                          'sup','sub','cite','time','footer',
+                          'nav','aside'}
+                INLINE_BOLD   = {'strong','b'}
+                INLINE_ITALIC = {'em','i'}
+                INLINE_CODE   = {'code'}
+                INLINE_DEL    = {'s','del','strike'}
+                INLINE_UNDER  = {'u'}
+
+                def __init__(self):
+                    super().__init__()
+                    self.out = []           # output tokens
+                    self.stack = []         # open tag stack
+                    self.ignore_depth = 0   # depth inside ignored tags
+                    self.pre_depth = 0      # depth inside <pre>
+                    self.list_stack = []    # ('ul'|'ol', counter)
+                    self.in_table = False
+                    self.td_buf = []        # cells in current row
+                    self.header_row = False
+                    self.col_widths = []
+                    self.link_text_buf = [] # buffer for <a> inner text
+                    self.in_link = False    # inside <a> tag
+                    self.cell_buf = []      # buffer for td/th inner text
+                    self.in_cell = False    # inside td or th
+
+                def _tag(self):
+                    return self.stack[-1] if self.stack else ''
+
+                def handle_starttag(self, tag, attrs):
+                    tag = tag.lower()
+                    adict = dict(attrs)
+
+                    if self.ignore_depth or tag in self.IGNORE:
+                        self.ignore_depth += 1
+                        self.stack.append(tag)
+                        return
+
+                    self.stack.append(tag)
+
+                    if tag in ('h1','h2','h3','h4','h5','h6'):
+                        level = int(tag[1])
+                        self.out.append('\n\n' + '#' * level + ' ')
+                    elif tag == 'p':
+                        self.out.append('\n\n')
+                    elif tag in ('ul', 'ol'):
+                        counter = 0 if tag == 'ol' else None
+                        self.list_stack.append([tag, counter])
+                        self.out.append('\n')
+                    elif tag == 'li':
+                        if self.list_stack:
+                            kind, counter = self.list_stack[-1]
+                            if kind == 'ol':
+                                self.list_stack[-1][1] += 1
+                                prefix = f"{self.list_stack[-1][1]}. "
+                            else:
+                                prefix = '• '
+                            indent = '  ' * (len(self.list_stack) - 1)
+                            self.out.append(f'\n{indent}{prefix}')
+                    elif tag == 'blockquote':
+                        self.out.append('\n\n> ')
+                    elif tag == 'pre':
+                        self.pre_depth += 1
+                        self.out.append('\n\n```')
+                    elif tag == 'code':
+                        if self.pre_depth == 0:
+                            # Try to get language class
+                            cls = adict.get('class', '')
+                            lang = ''
+                            for part in cls.split():
+                                if part.startswith('language-'):
+                                    lang = part[9:]
+                            if lang:
+                                self.out.append(f'`')
+                            else:
+                                self.out.append('`')
+                    elif tag in self.INLINE_BOLD:
+                        self.out.append('**')
+                    elif tag in self.INLINE_ITALIC:
+                        self.out.append('*')
+                    elif tag in self.INLINE_DEL:
+                        self.out.append('~~')
+                    elif tag in self.INLINE_UNDER:
+                        self.out.append('__')
+                    elif tag == 'a':
+                        href = adict.get('href', '')
+                        self.stack[-1] = ('a', href)   # store href for close
+                        self.in_link = True
+                        self.link_text_buf = []
+                    elif tag == 'br':
+                        self.out.append('  \n')
+                    elif tag == 'hr':
+                        self.out.append('\n\n---\n\n')
+                    elif tag == 'table':
+                        self.in_table = True
+                        self.out.append('\n\n')
+                    elif tag == 'tr':
+                        self.td_buf = []
+                    elif tag in ('th', 'thead'):
+                        if tag == 'thead':
+                            self.header_row = True
+                        else:  # th
+                            self.in_cell = True
+                            self.cell_buf = []
+                    elif tag == 'td':
+                        self.in_cell = True
+                        self.cell_buf = []
+                        alt = adict.get('alt', '')
+                        src = adict.get('src', '')
+                        if alt:
+                            self.out.append(f'[image: {alt}]')
+
+                def handle_endtag(self, tag):
+                    tag = tag.lower()
+                    if not self.stack:
+                        return
+
+                    # Pop matching tag (handle mismatches gracefully)
+                    for i in range(len(self.stack)-1, -1, -1):
+                        if self.stack[i] == tag or (
+                            isinstance(self.stack[i], tuple) and self.stack[i][0] == tag
+                        ):
+                            entry = self.stack.pop(i)
+                            break
+                    else:
+                        return
+
+                    if self.ignore_depth:
+                        self.ignore_depth -= 1
+                        return
+
+                    if tag in ('h1','h2','h3','h4','h5','h6'):
+                        self.out.append('\n')
+                    elif tag == 'p':
+                        self.out.append('\n')
+                    elif tag in ('ul', 'ol'):
+                        if self.list_stack:
+                            self.list_stack.pop()
+                        self.out.append('\n')
+                    elif tag == 'li':
+                        pass
+                    elif tag == 'blockquote':
+                        self.out.append('\n\n')
+                    elif tag == 'pre':
+                        self.pre_depth -= 1
+                        self.out.append('\n```\n\n')
+                    elif tag == 'code':
+                        if self.pre_depth == 0:
+                            self.out.append('`')
+                    elif tag in self.INLINE_BOLD:
+                        self.out.append('**')
+                    elif tag in self.INLINE_ITALIC:
+                        self.out.append('*')
+                    elif tag in self.INLINE_DEL:
+                        self.out.append('~~')
+                    elif tag in self.INLINE_UNDER:
+                        self.out.append('__')
+                    elif tag == 'a':
+                        href = entry[1] if isinstance(entry, tuple) else ''
+                        self.in_link = False
+                        # Join buffered link text and strip timestamp noise
+                        link_text = ''.join(self.link_text_buf).strip()
+                        # Remove leading/trailing timestamp patterns: "1m", "2h", "3d" etc.
+                        link_text = re.sub(r'^\d+[smhdw]\s*', '', link_text)
+                        link_text = re.sub(r'\s*\d+[smhdw]$', '', link_text)
+                        link_text = link_text.strip()
+                        if link_text and href:
+                            self.out.append(f'[{link_text}]({href})')
+                        elif link_text:
+                            self.out.append(link_text)
+                        elif href:
+                            self.out.append(href)
+                        self.link_text_buf = []
+                    elif tag in ('td', 'th'):
+                        self.in_cell = False
+                        cell_text = ''.join(self.cell_buf).strip()
+                        self.td_buf.append(cell_text)
+                        self.cell_buf = []
+                    elif tag == 'tr':
+                        row = ' | '.join(self.td_buf)
+                        self.out.append(f'| {row} |\n')
+                        if self.header_row:
+                            sep = ' | '.join(['---'] * len(self.td_buf))
+                            self.out.append(f'| {sep} |\n')
+                            self.header_row = False
+                        self.td_buf = []
+                    elif tag == 'table':
+                        self.in_table = False
+                        self.out.append('\n')
+
+                def handle_data(self, data):
+                    if self.ignore_depth:
+                        return
+                    if self.pre_depth:
+                        self.out.append(data)
+                    elif self.in_link:
+                        t = re.sub(r'\s+', ' ', data)
+                        if not re.match(r'^\s*\d+[smhdw]\s*$', t):
+                            self.link_text_buf.append(t)
+                    elif self.in_cell:
+                        self.cell_buf.append(re.sub(r'\s+', ' ', data))
+                    else:
+                        collapsed = re.sub(r'\s+', ' ', data)
+                        self.out.append(collapsed)
+
+                def handle_entityref(self, name):
+                    entities = {'amp':'&','lt':'<','gt':'>','quot':'"',
+                                'nbsp':' ','mdash':'—','ndash':'–','hellip':'…',
+                                'ldquo':'"','rdquo':'"','lsquo':''','rsquo':'''}
+                    self.out.append(entities.get(name, f'&{name};'))
+
+                def handle_charref(self, name):
+                    try:
+                        if name.startswith('x'):
+                            self.out.append(chr(int(name[1:], 16)))
+                        else:
+                            self.out.append(chr(int(name)))
+                    except:
+                        pass
+
+                def get_md(self):
+                    text = ''.join(str(x) for x in self.out)
+                    # Normalize excessive blank lines
+                    text = re.sub(r'\n{3,}', '\n\n', text)
+                    return text.strip()
+
+            parser = _MDParser()
+            parser.feed(html)
+            return parser.get_md()
 
         except Exception as e:
-            return f"[Scrape Error] {str(e)}"
+            # Absolute last resort: strip all tags
+            return re.sub(r'<[^>]+>', '', html).strip()
+
+    def _render_md_terminal(self, md: str) -> str:
+        """
+        Render Markdown with ANSI escape codes for terminal display.
+        Handles: h1-h6, bold, italic, strikethrough, inline code,
+                 fenced code blocks, blockquotes, ul/ol lists, hr, links.
+        Falls back to plain text if terminal doesn't support ANSI.
+        """
+        import os
+        # Detect if terminal supports color
+        if not (hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()):
+            return md  # plain text for pipes / redirects
+
+        RESET  = '\033[0m'
+        BOLD   = '\033[1m'
+        DIM    = '\033[2m'
+        ITALIC = '\033[3m'
+        STRIKE = '\033[9m'
+        CYAN   = '\033[36m'
+        YELLOW = '\033[33m'
+        GREEN  = '\033[32m'
+        BLUE   = '\033[34m'
+        MAGENTA= '\033[35m'
+        BG_DARK= '\033[48;5;236m'  # dark grey bg for code blocks
+
+        lines = md.split('\n')
+        out = []
+        in_code = False
+        code_lang = ''
+
+        for line in lines:
+            # ── Fenced code block ──
+            if line.startswith('```'):
+                if not in_code:
+                    in_code = True
+                    code_lang = line[3:].strip()
+                    label = f' {code_lang} ' if code_lang else ' code '
+                    out.append(f'{BG_DARK}{DIM}{label}{RESET}')
+                else:
+                    in_code = False
+                    out.append(f'{BG_DARK}{DIM} ─── {RESET}')
+                continue
+
+            if in_code:
+                out.append(f'{BG_DARK}{GREEN}{line}{RESET}')
+                continue
+
+            # ── Horizontal rule ──
+            if re.match(r'^---+$', line.strip()):
+                out.append(f'{DIM}{"─" * 60}{RESET}')
+                continue
+
+            # ── Headings ──
+            m = re.match(r'^(#{1,6})\s+(.*)', line)
+            if m:
+                level = len(m.group(1))
+                text  = m.group(2)
+                colors = [YELLOW, YELLOW, CYAN, CYAN, MAGENTA, MAGENTA]
+                prefix = ['━━ ', '── ', '▸ ', '· ', '  · ', '   · ']
+                c = colors[level-1]
+                p = prefix[level-1]
+                out.append(f'\n{BOLD}{c}{p}{text}{RESET}')
+                continue
+
+            # ── Blockquote ──
+            if line.startswith('> '):
+                text = line[2:]
+                text = _apply_inline(text, BOLD, ITALIC, STRIKE, CYAN, DIM, RESET)
+                out.append(f'{DIM}│{RESET} {ITALIC}{text}{RESET}')
+                continue
+
+            # ── Lists ──
+            m_ul = re.match(r'^(\s*)[•\-\*]\s+(.*)', line)
+            m_ol = re.match(r'^(\s*)(\d+)\.\s+(.*)', line)
+            if m_ul:
+                indent = m_ul.group(1)
+                text   = m_ul.group(2)
+                text   = _apply_inline(text, BOLD, ITALIC, STRIKE, CYAN, DIM, RESET)
+                bullet = f'{CYAN}•{RESET}' if len(indent) == 0 else f'{DIM}◦{RESET}'
+                out.append(f'{indent}{bullet} {text}')
+                continue
+            if m_ol:
+                indent = m_ol.group(1)
+                num    = m_ol.group(2)
+                text   = m_ol.group(3)
+                text   = _apply_inline(text, BOLD, ITALIC, STRIKE, CYAN, DIM, RESET)
+                out.append(f'{indent}{CYAN}{num}.{RESET} {text}')
+                continue
+
+            # ── Table row ──
+            if line.startswith('|') and line.endswith('|'):
+                cells = [c.strip() for c in line.strip('|').split('|')]
+                if all(re.match(r'^-+$', c) for c in cells):
+                    # separator row
+                    out.append(f'{DIM}' + '┼'.join('─' * (len(c)+2) for c in cells) + RESET)
+                else:
+                    rendered = f'{DIM}│{RESET} ' + f' {DIM}│{RESET} '.join(
+                        f'{BOLD}{c}{RESET}' if out and '─' not in out[-1] else c
+                        for c in cells
+                    ) + f' {DIM}│{RESET}'
+                    out.append(rendered)
+                continue
+
+            # ── Regular paragraph line ──
+            line = _apply_inline(line, BOLD, ITALIC, STRIKE, CYAN, DIM, RESET)
+            out.append(line)
+
+        return '\n'.join(out)
+
+    def _scrape_response(self) -> tuple[str, str]:
+        """
+        Returns (markdown, html) tuple.
+        markdown = human-readable MD for terminal
+        html     = raw cleaned HTML (for web-search mode display)
+        """
+        html = self._scrape_html()
+        if not html:
+            return ("[Error] Empty response", "")
+        md = self._html_to_md(html)
+        return (md, html)
 
     def _scrape_thinking(self) -> str:
         """Extract thinking content from blockquote inside last .markdown-prose"""
@@ -414,18 +1007,11 @@ class ZAIScraper:
                     // Clone and clean
                     const clone = block.cloneNode(true);
                     clone.querySelectorAll(
-                        'blockquote, details, [class*="think"], [class*="reason"]'
+                        'blockquote, details, [class*="think"], [class*="reason"], svg, script, style'
                     ).forEach(el => el.remove());
 
-                    const paras = clone.querySelectorAll('p, li, h1, h2, h3');
-                    const text = paras.length > 0
-                        ? Array.from(paras)
-                            .map(p => p.innerText?.trim() || '')
-                            .filter(t => t.length > 0)
-                            .join('\\n\\n')
-                        : clone.innerText?.trim() || '';
-
-                    if (text) history.push({ role: 'assistant', content: text });
+                    const html = clone.innerHTML.trim();
+                    if (html) history.push({ role: 'assistant', content: html });
                 });
 
                 // Try to interleave user messages
@@ -483,6 +1069,18 @@ class ZAIScraper:
                     })(),
                     blockquoteCount: document.querySelectorAll('div.markdown-prose blockquote').length,
                     pTagCount: document.querySelectorAll('div.markdown-prose p').length,
+                    lastTurnSiblingBlocks: (() => {
+                        const all = document.querySelectorAll('div.markdown-prose');
+                        if (!all.length) return 0;
+                        let count = 1;
+                        let sib = all[all.length - 1].previousElementSibling;
+                        while (sib && sib.classList.contains('markdown-prose')) {
+                            count++;
+                            sib = sib.previousElementSibling;
+                        }
+                        return count;
+                    })(),
+                    hasThinking: !!document.querySelector('div.markdown-prose blockquote'),
                 };
             }""")
 
@@ -494,6 +1092,8 @@ class ZAIScraper:
             print(f"  Splash visible   : {info.get('splashVisible')}")
             print(f"  #chat-input      : {'✓' if info.get('chatInputExists') else '✗'}")
             print(f"  .markdown-prose  : {info.get('markdownProseCount')} blocks")
+            print(f"  Last turn blocks : {info.get('lastTurnSiblingBlocks')} (web-search may have multiple)")
+            print(f"  Has thinking     : {'✓' if info.get('hasThinking') else '✗'}")
             print(f"  blockquotes      : {info.get('blockquoteCount')}")
             print(f"  <p> tags         : {info.get('pTagCount')}")
             print(f"  Last response    : {info.get('lastMarkdownText', '')[:100]}")
@@ -606,7 +1206,11 @@ def main():
                         for msg in history:
                             icon = "🧑" if msg["role"] == "user" else "🤖"
                             print(f"\n{icon} {msg['role'].upper()}:")
-                            print(msg["content"])
+                            if msg["role"] == "assistant":
+                                md = scraper._html_to_md(msg["content"])
+                                print(scraper._render_md_terminal(md))
+                            else:
+                                print(msg["content"])
                         print("=" * 60 + "\n")
                     elif cmd == "/debug":
                         scraper.debug_dom()
@@ -629,8 +1233,22 @@ def main():
 
                 # ── Send ──
                 print("🤖 AI: ", end="", flush=True)
-                response = scraper.send_message(user_input)
-                print("\n" + response + "\n")
+                md, html, was_web = scraper.send_message(user_input)
+                print()  # newline after wait indicators
+
+                if was_web and html:
+                    # Web search: show full rich MD (converted from complete HTML)
+                    label = "🌐 Web Search Response"
+                    print(f"\n{'─'*60}")
+                    print(f"  {label}")
+                    print(f"{'─'*60}")
+                    rendered = scraper._render_md_terminal(md)
+                    print(rendered)
+                    print(f"{'─'*60}\n")
+                else:
+                    # Plain / thinking mode: ANSI-rendered markdown
+                    rendered = scraper._render_md_terminal(md)
+                    print(rendered + "\n")
 
             except KeyboardInterrupt:
                 break
