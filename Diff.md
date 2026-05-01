@@ -1,4 +1,4 @@
-**Old vs New approach 
+**Old vs New approach**
 
 | Old | New |
 |---|---|
