@@ -95,7 +95,6 @@ def print_help():
     table.add_column("Description", style="#94A3B8")
     for cmd, desc in [
         ("/new",      "Start a new conversation"),
-        ("/thinking", "Show last reasoning / thinking block"),
         ("/history",  "Display full conversation history"),
         ("/debug",    "Inspect DOM state"),
         ("/save",     "Save browser session to disk"),
@@ -118,8 +117,7 @@ def spinner_ctx(message: str, style: str = "#A78BFA"):
 def render_response(md_text: str, was_web: bool, has_thinking: bool, elapsed: float):
     tags = []
     if was_web:       tags.append("[web_label]🌐 Web Search[/web_label]")
-    if has_thinking:  tags.append("[think_label]💭 Thinking[/think_label]")
-    if not tags:      tags.append("[ai_label]✦ Response[/ai_label]")
+    tags.append("[ai_label]✦ Response[/ai_label]")
     title = "  ".join(tags) + f"  [muted]({elapsed:.1f}s)[/muted]"
 
     console.print(Panel(
@@ -138,6 +136,7 @@ def render_thinking(thinking_text: str):
         border_style="think_label", box=box.ROUNDED,
     ))
     console.print()
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -674,9 +673,6 @@ def main():
                         break
                     elif cmd == "/new":
                         scraper.new_chat()
-                    elif cmd == "/thinking":
-                        t = scraper._scrape_thinking()
-                        render_thinking(t) if t else console.print("[muted]  (No thinking block found)[/muted]\n")
                     elif cmd == "/history":
                         history = scraper.get_full_conversation()
                         if not history:
@@ -717,8 +713,10 @@ def main():
                 # ── Send & render ──
                 console.print()
                 md, html, was_web, elapsed = scraper.send_message(user_input)
-                has_thinking = bool(scraper._scrape_thinking())
-                render_response(md, was_web, has_thinking, elapsed)
+                thinking = scraper._scrape_thinking()
+                if thinking:
+                    render_thinking(thinking)
+                render_response(md, was_web, bool(thinking), elapsed)
 
             except KeyboardInterrupt:
                 console.print("\n[muted]  Interrupted.[/muted]")
