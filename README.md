@@ -3,10 +3,9 @@ this will use the Playwright to intract with zai , feed the input to ai from ter
 
 ---
 
-# IMA-Agent Backend Server API Documentation
+# Zai Server Backend Server API Documentation
 
 **Version:** 1.0.0  
-**Title:** IMA-Agent API  
 **Description:** Local REST API bridge between the IMA-Agent VS Code extension and [chat.z.ai](https://chat.z.ai).
 
 ---
@@ -229,6 +228,5 @@ Once running, visit:
 - ReDoc: http://localhost:8765/redoc
 
 ---
-
-**Project:** IMA-Agent Backend  
+ 
 **Purpose:** Bridge between VS Code Extension and chat.z.ai
